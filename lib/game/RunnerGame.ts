@@ -6,6 +6,11 @@ import { createCamera } from "@/lib/three/createCamera";
 import { resizeRendererToDisplaySize } from "@/lib/three/resize";
 import { GAME } from "@/lib/game/constants";
 import type { RunnerGameOptions } from "@/lib/game/types";
+import { KeyboardInput } from "@/lib/game/input/KeyboardInput";
+import { Player } from "@/lib/game/entities/Player";
+import { Spawner } from "@/lib/game/systems/Spawner";
+import { Collision } from "@/lib/game/systems/Collision";
+import { Pickups } from "@/lib/game/systems/Pickups";
 
 export class RunnerGame {
   private opts: RunnerGameOptions;
@@ -19,9 +24,18 @@ export class RunnerGame {
 
   private score = 0;
   private speed = GAME.SPEED_START;
+  private gameOver = false;
 
-  // simple placeholder objects so we see something
-  private debugCube: THREE.Mesh;
+  private input: KeyboardInput;
+  private player: Player;
+
+  private spawner: Spawner;
+  private collision: Collision;
+  private pickups: Pickups;
+
+  // HUD state
+  private coins = 0;
+  private multiplier = 1;
 
   constructor(opts: RunnerGameOptions) {
     this.opts = opts;
@@ -29,31 +43,26 @@ export class RunnerGame {
     this.scene = createScene();
     this.camera = createCamera();
 
-    // Create and attach renderer to host
     this.renderer = createRenderer();
     this.opts.host.appendChild(this.renderer.domElement);
 
-    // Add a visible object for now
-    this.debugCube = new THREE.Mesh(
-      new THREE.BoxGeometry(1, 1, 1),
-      new THREE.MeshStandardMaterial({ color: 0x55ffaa })
-    );
-    this.debugCube.position.set(0, 1, 0);
-    this.scene.add(this.debugCube);
+    this.input = new KeyboardInput();
+    this.player = new Player();
+    this.scene.add(this.player.mesh);
 
-    // Ground plane-ish block
-    const ground = new THREE.Mesh(
-      new THREE.BoxGeometry(8, 1, 30),
-      new THREE.MeshStandardMaterial({ color: 0x1b2a4a, roughness: 1 })
-    );
-    ground.position.set(0, 0, -5);
-    this.scene.add(ground);
+    this.spawner = new Spawner(this.scene);
+    this.spawner.init();
 
-    // initial camera target
+    this.collision = new Collision();
+    this.pickups = new Pickups();
+
     this.camera.lookAt(0, 1, 0);
 
-    // basic resize
     window.addEventListener("resize", this.onResize);
+  }
+
+  getHUDState() {
+    return { coins: this.coins, multiplier: this.multiplier };
   }
 
   start() {
@@ -69,9 +78,17 @@ export class RunnerGame {
   }
 
   restart() {
-    // For now: reset simple state. Later we’ll reset entities and spawners.
     this.score = 0;
     this.speed = GAME.SPEED_START;
+    this.gameOver = false;
+
+    this.player.reset();
+    this.spawner.init();
+
+    this.pickups.reset();
+    this.coins = 0;
+    this.multiplier = 1;
+
     this.opts.onScoreChange?.(this.score);
   }
 
@@ -79,13 +96,15 @@ export class RunnerGame {
     this.stop();
     window.removeEventListener("resize", this.onResize);
 
-    // Remove canvas
+    this.input.dispose();
+
+    this.scene.remove(this.player.mesh);
+    this.player.mesh.geometry.dispose();
+    (this.player.mesh.material as THREE.Material).dispose();
+
+    this.spawner.dispose();
+
     this.renderer.domElement.remove();
-
-    // Dispose three resources we created
-    this.debugCube.geometry.dispose();
-    (this.debugCube.material as THREE.Material).dispose();
-
     this.renderer.dispose();
   }
 
@@ -93,24 +112,71 @@ export class RunnerGame {
     resizeRendererToDisplaySize(this.renderer, this.camera);
   };
 
+  private crash() {
+    if (this.gameOver) return;
+    this.gameOver = true;
+    this.opts.onGameOver?.();
+  }
+
   private loop = () => {
     this.rafId = requestAnimationFrame(this.loop);
 
     const dt = Math.min(this.clock.getDelta(), 0.033);
+    const keys = this.input.snapshot();
 
-    // Update placeholder “game”
-    this.speed += dt * 0.15;
-    this.score += Math.floor(this.speed * dt);
+    if (keys.restartPressed) this.restart();
+
+    if (this.gameOver) {
+      resizeRendererToDisplaySize(this.renderer, this.camera);
+      this.renderer.render(this.scene, this.camera);
+      return;
+    }
+
+    // Input → player intentions
+    if (keys.leftPressed) this.player.moveLeft();
+    if (keys.rightPressed) this.player.moveRight();
+    if (keys.jumpPressed) this.player.jump();
+
+    // Speed ramp + distance step
+    this.speed += dt * GAME.SPEED_RAMP;
+    const dz = this.speed * dt;
+
+    // Update entities
+    this.player.update(dt);
+
+    // Move world toward camera + recycle chunks
+    this.spawner.update(dz);
+
+    // Pickups update + coin spin + collection
+    this.pickups.update(dt);
+
+    const allCoins = this.spawner.chunks.flatMap((c) => c.coins);
+    for (const c of allCoins) c.update(dt);
+
+    this.pickups.collectFrom(this.player.mesh, allCoins);
+
+    const p = this.pickups.getState();
+    this.coins = p.coins;
+    this.multiplier = p.multiplier;
+
+    // Score gain affected by multiplier
+    const baseGain = Math.floor(dz * 10);
+    this.score += this.pickups.scoreGain(baseGain);
     this.opts.onScoreChange?.(this.score);
 
-    // Animate the cube a bit so we know it’s alive
-    this.debugCube.rotation.y += dt * 1.2;
-    this.debugCube.position.x = Math.sin(performance.now() / 600) * 1.2;
+    // Collision with obstacles
+    const obs = this.spawner.getAllObstacles();
+    for (const o of obs) {
+      if (this.collision.intersects(this.player.mesh, o.mesh)) {
+        this.crash();
+        break;
+      }
+    }
 
-    // Camera gentle follow
-    const target = new THREE.Vector3(this.debugCube.position.x, 5.5, 10);
-    this.camera.position.lerp(target, 2.5 * dt);
-    this.camera.lookAt(this.debugCube.position.x, 1.2, 0);
+    // Camera follow
+    const camTarget = new THREE.Vector3(this.player.mesh.position.x, 5.5, 10);
+    this.camera.position.lerp(camTarget, 3 * dt);
+    this.camera.lookAt(this.player.mesh.position.x, 1.2, 0);
 
     resizeRendererToDisplaySize(this.renderer, this.camera);
     this.renderer.render(this.scene, this.camera);
